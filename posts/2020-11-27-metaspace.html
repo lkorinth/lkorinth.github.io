@@ -1,0 +1,90 @@
+<!doctype html>
+<html lang="en">
+    <head>
+        <meta charset="utf-8">
+        <meta http-equiv="x-ua-compatible" content="ie=edge">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <title>Garbage? Blog - Metaspace in OpenJDK 16</title>
+        <link rel="stylesheet" type="text/css" href="https://cdn.rawgit.com/dreampulse/computer-modern-web-font/master/fonts.css">
+        <link rel="stylesheet" href="../css/default.css" />
+    </head>
+    <body>
+        <header>
+            <nav>
+                <a href="../">Home</a>
+                <a href="../about.html">About</a>
+           <!--  enable with more posts <a href="/archive.html">Archive</a> -->
+            </nav>
+        </header>
+
+        <main role="main">
+            <h1>Metaspace in OpenJDK 16</h1>
+            <article>
+    <section class="header">
+      Posted: 2020-11-27 [<a href="2020-11-27-metaspace.pdf">pdf</a>, <a href="2020-11-27-metaspace.epub">epub</a>]
+        
+    </section>
+    <section>
+        <p></p>
+<p>Thomas Stüfe (working for SAP) has contributed <a href="https://github.com/openjdk/jdk/pull/336">a new Metaspace</a> as described in <a href="https://openjdk.java.net/jeps/387">JEP 387</a>. This is a great example of an improvement made to OpenJDK by contributors outside of Oracle.</p>
+<h1 id="metaspace-improvements-in-openjdk-16">Metaspace improvements in OpenJDK 16</h1>
+<p>When you start using Java 16, you will benefit from the new Metaspace — without doing anything.</p>
+<ul>
+<li>Fragmentation in Metaspace will be reduced, resulting in lower memory usage.</li>
+<li>When memory is not used any more, there is a much higher probability that it can be returned to the operating system, which will reduce the memory footprint of the JVM process.</li>
+</ul>
+<p>If you are doing lots of class loading and want to trim memory usage, this change should be of interest to you! Before this change, small class loaders wasted lots of memory due to inflexibility in chunk sizes; for small class loaders <em>huge</em> savings can be made in Metaspace. Even in normal applications such as WildFly or Eclipse, memory reductions can be significant (&gt;10%) in Metaspace. Take a look at the <a href="https://github.com/tstuefe/jep387/blob/master/pres/elastic-metaspace.pdf">presentation</a> by Thomas Stüfe, statistics starting at page 47.</p>
+<h1 id="metaspace-background">Metaspace background</h1>
+<p>Metaspace is the name of a memory allocator (or the space used by the allocator). It allocates memory outside the Java heap. This memory is mostly used for class metadata, but it could be used as a general arena allocator as well. Prior to JDK 8, metadata was allocated in a special part of the Java heap called the permanent generation, or PermGen.</p>
+<p>An allocator needs to be able to allocate and — most often — free memory. Metaspace has one additional important feature in that you can make it allocate memory within a specified <em>address space</em>. With this feature, each Java object can reach class data using a 32-bit index instead of wasting a 64-bit pointer on <em>each object header</em>. This feature is called <a href="https://stuefe.de/posts/metaspace/what-is-compressed-class-space">compressed class pointers</a> and works very similar to <a href="https://wiki.openjdk.java.net/display/HotSpot/CompressedOops">compressed oops</a>.</p>
+<p>Class loading/unloading mostly follow the allocation pattern of allocating data without freeing until the classloader is discarded (and then everything is freed). This usage pattern allows us to tune the allocator somewhat in addition to support compressed class pointers.</p>
+<h2 id="why-not-use-an-ordinary-allocator-such-as-malloc">Why not use an ordinary allocator such as malloc?</h2>
+<p>The generic malloc does not know how to allocate in a restricted memory space (for compressed class pointers). So either all references to class metadata must go through an indirection table (requires compiler changes, with a possible performance impact) or we need a special malloc. Metaspace can be seen as this special malloc that knows how to allocate to a small address space. Using malloc was <a href="https://openjdk.java.net/jeps/387#Alternatives">tested and rejected</a>.</p>
+<h1 id="short-walk-through">Short walk-through</h1>
+<h2 id="chunk-allocation-using-a-buddy-allocator">Chunk allocation using a buddy allocator</h2>
+<p>Memory is allocated from the operating system in <code>VirtualSpaceNode</code>s. When not allocating into compressed class space (blue), these will be stored in one linked list with many nodes. When allocating into compressed class space (orange), the list will contain precisely one <code>VirtualSpaceNode</code> reserving a 32-bit address space thus guaranteeing access with compressed pointers. Although the whole address space is reserved at once, memory is committed lazily only when being used.</p>
+<p>Each <code>VirtualSpaceNode</code> will have a bitmap keeping track of which commit granules have been committed, more information on this further down.</p>
+<figure>
+<img src="../images/metaspace/space_node_list.svg" id="fig:space_node_list" style="width:100.0%" alt /><figcaption>A JVM running with compressed class pointers will have two <code>VirtualSpaceNodeList</code>s, one for “normal” objects, one for objects that needs to be addressed by compressed class pointers.</figcaption>
+</figure>
+<p>Every <code>VirtualSpaceNode</code> is divided into several, in address space consecutive <code>RootChunkArea</code>s, currently sized 4 MiB. This is the max size of a memory allocation. A <code>RootChunkArea</code> is an area that can be recursively halved into smaller areas of logarithmic size, 4, 2, 1, ½, … MiB. These chunks can cheaply be removed or merged back using a <a href="https://en.wikipedia.org/wiki/Buddy_memory_allocation">buddy allocator</a> scheme. When added back, the chunk will try to recursively merge into its neighbour <em>buddy</em> reducing <em>external</em> fragmentation.</p>
+<figure>
+<img src="../images/metaspace/buddy_allocator_0.svg" style="width:100.0%" alt /><figcaption>Blue class loader allocates a 1 MiB block, the root chunk needs to be divided twice.</figcaption>
+</figure>
+<figure>
+<img src="../images/metaspace/buddy_allocator_1.svg" style="width:100.0%" alt /><figcaption>Orange classloader allocates 256 KiB; note that both class loaders might allocate chunks from the same <code>RootChunkArea</code>.</figcaption>
+</figure>
+<figure>
+<img src="../images/metaspace/buddy_allocator_2.svg" style="width:100.0%" alt /><figcaption>When the orange class loader is destroyed, the free 256 KiB chunk will merge with its buddy chunk twice, leaving big consecutive areas without external fragmentation.</figcaption>
+</figure>
+<p>In the general case, the JVM will have two instances of <code>VirtualSpaceNode</code> lists, one with a compressed space where class data is put, and one uncompressed that is not limited by address space and used for everything not needing compressed class pointers.</p>
+<h2 id="class-loader-allocation-and-destruction">Class loader allocation and destruction</h2>
+<p>The JVM always allocates through a class loader. A JVM contains many class loaders; they are created and destroyed during the lifetime of the JVM process. Each class loader will allocate chunks from the two JVM-global <code>VirtualSpaceList</code>s. From these big chunks of memory, the amount of bytes needed for the current allocation will be bump allocated to the user. The remainder of the chunk can be bump allocated from later.</p>
+<figure>
+<img src="../images/metaspace/bump_allocator.svg" style="width:100.0%" alt /><figcaption>Bump allocation in chunks</figcaption>
+</figure>
+<p>Bump allocation is used because it is tight (removes <em>internal</em> fragmentation) and cheap. Early return of memory is uncommon, which will lessen the problem of external fragmentation of bump allocation, and the buddy allocator will leave no external fragmentation when the classloader is purged. For the less common cases when memory is freed before class loader destruction, the memory will be placed in <code>FreeBlocks</code>.</p>
+<figure>
+<img src="../images/metaspace/free_blocks.svg" style="width:100.0%" alt /><figcaption><code>FreeBlocks</code> (storage of freed allocations)</figcaption>
+</figure>
+<p>This “free list” is implemented as a lookup table for small binned sizes, and as a tree for larger sizes. When the class loader is destructed, free chunks will be returned and merged back by the buddy allocator reducing fragmentation.</p>
+<figure>
+<img src="../images/metaspace/all_in_one.svg" style="width:100.0%" alt /><figcaption>All parts interacting</figcaption>
+</figure>
+<h2 id="committing-and-releasing-memory">Committing and releasing memory</h2>
+<p>Each <code>VirtualSpaceNode</code> contains a bitmap that keeps track of what memory is committed. Every bit represents a commit granule. Even if a big chunk is allocated, the memory is committed lazily on bump allocation, and thus, memory usage is kept tight to a commit granule.</p>
+<p>One of the improvements to the new Metaspace is how committing memory is now handled on a granule level; this is much tighter than the previous predetermined chunk size. This in combination with fragmentation reductions will result in less memory usage by the JVM process.</p>
+<p>As objects are always allocated by chunks belonging to a specific class loader (by the buddy allocator), memory allocations between different class loaders never interleave (within a chunk). When a class loader is purged, most memory of the chunks can be returned to the operating system as class loader data from other class loaders can not interfere.</p>
+<h1 id="further-reading">Further reading</h1>
+<p>If you want a better and more complete picture of Metaspace, you should read the much more detailed <a href="http://cr.openjdk.java.net/~stuefe/jep387/review/2020-09-03/guide/review-guide.html">review guide</a> of the Metaspace written by the implementer Thomas Stüfe, or visit his <a href="https://stuefe.de/">blog</a> for video presentations, and other topics. There is also the <a href="https://wiki.openjdk.java.net/display/HotSpot/Metaspace">Metaspace wiki</a> at OpenJDK.</p>
+    </section>
+</article>
+
+        </main>
+
+        <footer>
+          What I write is my opinion and <bf>not</bf> the opinion of my
+employer.
+        </footer>
+    </body>
+</html>

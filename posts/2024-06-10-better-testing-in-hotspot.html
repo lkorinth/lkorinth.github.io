@@ -1,0 +1,134 @@
+<!doctype html>
+<html lang="en">
+    <head>
+        <meta charset="utf-8">
+        <meta http-equiv="x-ua-compatible" content="ie=edge">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <title>Garbage? Blog - Better testing in HotSpot</title>
+        <link rel="stylesheet" type="text/css" href="https://cdn.rawgit.com/dreampulse/computer-modern-web-font/master/fonts.css">
+        <link rel="stylesheet" href="../css/default.css" />
+    </head>
+    <body>
+        <header>
+            <nav>
+                <a href="../">Home</a>
+                <a href="../about.html">About</a>
+           <!--  enable with more posts <a href="/archive.html">Archive</a> -->
+            </nav>
+        </header>
+
+        <main role="main">
+            <h1>Better testing in HotSpot</h1>
+            <article>
+    <section class="header">
+      Posted: 2024-06-10 [<a href="2024-06-10-better-testing-in-hotspot.pdf">pdf</a>, <a href="2024-06-10-better-testing-in-hotspot.epub">epub</a>]
+        
+    </section>
+    <section>
+        <p></p>
+<h1 id="testing-behaviour-defined-by-vm-flags">Testing behaviour defined by VM flags</h1>
+<p>When testing certain HotSpot features, VM flags must be used to enable certain behaviour. Many features, especially in the GC, compiler and runtime areas can not be enabled programmatically using function calls. Instead of enabling a behaviour to an existing VM programmatically, a new VM must be forked, and the feature must be enabled using command line flags. It would be extremely hard to change many things after startup, so many things must be set at VM startup.</p>
+<p>When testing a specific feature in hotspot — GC for example — this is natural. We need to disable compressed class pointers if we want to test non-compressed class pointers when class pointers are compressed by default. How many such tests do we need to write to cover usage of non-compressed class pointers? There is also another dimension to this problem; certain flags <em>interact</em>. Are we to write tests for infinite combinations of flags?</p>
+<p>Many bugs are found in test cases designed to test <em>unrelated</em> things. Would it not be great if we could reuse — almost — all test cases and run them with our VM flag combination of interest?</p>
+<p>The rest of this post will discuss how to propagate VM options to a testcase, and by doing so enabling the reuse of the test for testing flag combinations.</p>
+<h2 id="adding-vm-flags-from-a-test-suite">Adding VM flags from a test suite</h2>
+<p>All test cases in OpenJDK written in Java are written in the test framework jtreg. Runtime flags can be given in the testcase itself, but can also be <em>added</em> to the testcase by the one running the testcase. Jtreg supports running a testcase with these <em>extra</em> runtime flags by giving the <a href="https://openjdk.org/jtreg/command-help.html">argument</a> <code>-javaoption(s)</code> to jtreg or modifying the <code>make</code> <a href="https://github.com/openjdk/jdk/blob/master/doc/testing.md">command line</a> with something like <code>JTREG='JAVA_OPTIONS=...'</code></p>
+<p>VM flags can also be modified using <code>-vmoption(s)</code> or <code>JTREG='VM_OPTIONS=...'</code>; <em>this is almost never what you want to do</em>. The reason is that these flags will not only be propagated to the test case but also to <code>javac</code> and other tools when they are spawned by jtreg.</p>
+<h2 id="how-vm-flags-are-propagated-to-a-test-case">How VM flags are propagated to a test case</h2>
+<p>Jtreg test cases are annotated with <a href="https://openjdk.org/jtreg/tag-spec.html">tags</a> in the beginning of the test cases. These annotations are not <em>real</em> Java annotations, although they look very similar. They are Java comments that are parsed by jtreg.</p>
+<p>When specifying the <a href="https://openjdk.org/jtreg/tag-spec.html#ACTION_TAGS"><code>@run</code> tag</a>, options can be added describing how to run the testcase. Two main versions exists:</p>
+<dl>
+<dt><code>/othervm</code></dt>
+<dd>(spawn a new VM with each testcase)
+</dd>
+<dt><code>/agentvm</code></dt>
+<dd><p>(reuse a pool of test VMs). This version has two <a href="https://openjdk.org/jtreg/faq.html#how-do-i-specify-whether-to-run-tests-concurrently">sub modes</a> that can be set with <code>defaultExecMode</code> in <code>TEST.ROOT</code> for the test suite, and/or can be set by a command line option to jtreg.</p>
+<dl>
+<dt>same VM</dt>
+<dd>use the same VM to compile and run tests
+</dd>
+<dt>different VM</dt>
+<dd>use different VMs to compile and run tests (not to be confused with `/othervm`)
+</dd>
+</dl>
+</dd>
+</dl>
+<p>What is important to understand is that <em>all</em> these methods will propagate your <code>JAVA_OPTIONS</code> to the VM your test case is run in, when spawning a new testcase. A new VM will be spawned if the command line options have changed when using <code>agentvm</code>.</p>
+<p><em>However</em>, this is the behaviour <em>only</em> when running the <code>main</code> action. If you instead use the <code>driver</code> action of the <code>@run</code> tag, <em>most</em> VM options set by <code>JAVA_OPTIONS</code> will be filtered out. I think this is not documented, but the relevant behaviour can be found in <code>filterJavaOpts</code> in the <code>DriverAction</code> of jtreg. Thus:</p>
+<ul>
+<li>Use <code>main</code> for your <em>normal</em> test cases that are spawned directly by jtreg.</li>
+<li>If your code is a <em>driver</em>, that is, glue code that is used to launch a new JVM, you should use the <code>driver</code> action to filter JAVA/JVM options to the glue <em>driver</em> process. You should then use <code>createTestJavaProcessBuilder</code> to fork your test, and by that propagate the flags to your <em>test</em> JVM.</li>
+</ul>
+<p>There is a way to check for which flags was given to the VM being tested from within the testcase. In the test description a <code>@require</code> tag can be added. It will test for VM properties, such as active flags.</p>
+<h2 id="when-vm-flags-are-not-propagated-to-a-vm">When VM flags are not propagated to a VM</h2>
+<p>Although jtreg itself propagates <code>JAVA_OPTIONS</code>, many testcases spawn new VMs from <em>within</em> a testcase. This is done for multiple reasons: one may be interested in inspecting the spawned VM or parse its output, or maybe a permutation of VM flags should be tested. There <a href="https://github.com/openjdk/jdk/blob/master/test/lib/jdk/test/lib/process/ProcessTools.java">exists two main APIs</a> for spawning new Java test processes (and some helper versions calling these as well):</p>
+<ul>
+<li>createLimitedTestJavaProcessBuilder (does not propagate VM flags):
+<dl>
+<dt><span class="math inline">+</span></dt>
+<dd><em>This is easy to use</em> (no conflicting <code>JAVA_OPTIONS</code>, no need to <code>@require</code> absence of conflicting flags)
+</dd>
+<dt><span class="math inline">+</span></dt>
+<dd>stable test cases (no dynamic behaviour from clashes between <code>JAVA_OPTIONS</code> and the additional options added by the testcase)
+</dd>
+<dt><span class="math inline">−</span></dt>
+<dd>no propagation of flags, <em>bad test coverage</em>
+</dd>
+</dl></li>
+<li>createTestJavaProcessBuilder (does propagate VM flags, behaves as <code>@run</code>):
+<dl>
+<dt><span class="math inline">+</span></dt>
+<dd>propagation of flags — thus much better test coverage
+</dd>
+<dt><span class="math inline">−</span></dt>
+<dd>unfortunately, as <code>JAVA_FLAGS</code> are propagated, flag combinations not considered can cause a test crash or timeout
+</dd>
+<dt><span class="math inline">−</span></dt>
+<dd>complicated <code>@require</code> flags can mitigate some problems, but adds complexity
+</dd>
+<dt><span class="math inline">−</span></dt>
+<dd>complicated <code>@require</code> flags can cause the test to be <code>skipped</code> by mistake, an easy mistake that is hard to find.
+</dd>
+</dl></li>
+</ul>
+<p>From a <em>superficial</em> glance, <code>createLimitedTestJavaProcessBuilder</code> seems easier to use, and it is thus <em>understandable</em> that the limited API is used much more often. 699 occurrences versus 201 as can be seen below:</p>
+<div class="sourceCode" id="cb1"><pre class="sourceCode bash"><code class="sourceCode bash"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true"></a><span class="bu">cd</span> openjdk/test</span>
+<span id="cb1-2"><a href="#cb1-2" aria-hidden="true"></a><span class="fu">git</span> switch --detach 86623aa</span>
+<span id="cb1-3"><a href="#cb1-3" aria-hidden="true"></a><span class="fu">grep</span> -R createLimitedTestJavaProcessBuilder <span class="kw">|</span> <span class="fu">wc</span> -l</span>
+<span id="cb1-4"><a href="#cb1-4" aria-hidden="true"></a><span class="ex">699</span></span>
+<span id="cb1-5"><a href="#cb1-5" aria-hidden="true"></a><span class="fu">grep</span> -R createTestJavaProcessBuilder <span class="kw">|</span> <span class="fu">wc</span> -l</span>
+<span id="cb1-6"><a href="#cb1-6" aria-hidden="true"></a><span class="ex">201</span></span></code></pre></div>
+<p>The heavy usage of this limited API that does not propagate <code>JAVA_OPTIONS</code> compelled us to change the <a href="https://bugs.openjdk.org/browse/JDK-8315097">name</a> and <a href="https://bugs.openjdk.org/browse/JDK-8318962">documentation</a> to make it more obvious that one version is <em>limited</em> when it comes to test coverage. Although jtreg documentation asks us to <a href="https://openjdk.org/jtreg/writetests.html#JVMopts">respect command line compiler and VM options</a>, it is easier to write tests correctly if you get help from naming. Especially if you draw your inspiration from already existing testcases that more often than not, use the “wrong” API.</p>
+<h2 id="problems-when-not-propagating-vm-flags">Problems when not propagating VM flags</h2>
+<p>Although createLimitedTestJavaProcessBuilder is easier to use, it comes with problems.</p>
+<h3 id="test-coverage">Test coverage</h3>
+<p>If we spawn new processes without materializing <code>JAVA_OPTIONS</code>, those flags might never be tested in combinations with flags that we <em>do</em> test in the test case. At least at Oracle, we test each test suite with a range of flag combinations. This is of course expensive, both in equipment and in test time, but it is required to ensure quality. Each test case that does not propagate <code>JAVA_OPTIONS</code> will not benefit from this flag rotation.</p>
+<h3 id="test-performance">Test performance</h3>
+<p>If we test a certain test case using a number of flag combinations without materializing <code>JAVA_OPTIONS</code>, not only do we miss the opportunity of testing these combinations, but we waste energy and money by running effectively the same test case several times.</p>
+<p>If there is a hard need for not propagating <code>JAVA_OPTIONS</code>, this is uncommon, you can <code>@require</code> the <a href="https://github.com/openjdk/jdk/blob/master/test/jtreg-ext/requires/VMProps.java">property</a> <code>vm.flagless</code>. With <code>vm.flagless</code> you will not get good coverage, but at least the test case will not be run on all flag combinations.</p>
+<h2 id="writing-good-test-cases">Writing good test cases</h2>
+<p>If we put a bit more work in the test cases, <em>and accept that we will have crashes with flags that are not tested in the pipeline</em>, we can make our test cases use the non-limited createTestJavaProcessBuilder. It is more work and certain flag combinations might not work, <em>but we will be able to test flags</em>.</p>
+<p>The API <code>createLimitedTestJavaProcessBuilder</code> will test only <em>one of countless</em> flag combinations. Most testcases could probably benefit being tested with the interpreter, without compressed oops or maybe with another GC. Most bugs are found in testcases not created to test for the specific bug.</p>
+<p>If we further mark certain test cases with <code>@keyword flag-sensitive</code> we might filter out test failures easily.</p>
+<h1 id="problems-and-solutions">Problems and Solutions</h1>
+<p>Many of the test cases add their own flags. One can add <code>@require</code> lines so that the test case flags do not conflict with <code>JAVA_OPTIONS</code>. Unfortunately, adding too complicated <code>@require</code> lines might add to the risk of <em>never</em> running the test case by. This is problematic because it is easy to do this slightly wrong and extremely easy to not find that the tests are skipped. Although test cases do show as <em>skipped</em> if they are filtered out by <code>@require</code> lines, they <a href="https://bugs.openjdk.org/browse/CODETOOLS-7903557">look exactly as if they passed normally</a> if they throw the SkippedException.</p>
+<p>Certain test flags <em>must</em> be <code>@required</code> away. For example, you can not say that you want to use two kinds of GCs. So if you spawn a new process with a certain GC, you must ensure that another GC was not propagated through <code>JAVA_OPTIONS</code>.</p>
+<p>There is also the case when a flag does not conflict with another flag because of flag parsing, but will modify its behaviour. This is a bit trickier; we will not get an as easy to diagnose bug. A test case might fail or time out as a result — sometimes intermittently.</p>
+<p>Worth noting in this discussion is that <code>JAVA_OPTIONS</code> are <em>prepended</em> on the command line (from my understanding both from <code>@run</code> tags and from the function calls that spawn new VMs). This is interesting because — usually, but not always — the latter arguments wins if multiple arguments of the same type are given. This behaviour makes it slightly easier to write test cases. It has its pros and cons. Most often the flag your test case uses will <em>override</em> a conflicting flag given in <code>JAVA_OPTIONS</code>. However, this also highly limits the way we are able to <em>effectively</em> propagating flags to test cases.</p>
+<p>If a testcase is known to be fragile, it can be marked with <code>@keyword
+flag-sensitive</code> and then easily filtered out. GC tests need to know the size of heap and generations and will not work if these test preconditions change. One might mark these tests with <code>flag-sensitive</code> and if someone tests large test suites with a flag that modify these preconditions, that tester might filter out these fragile tests. It is not a perfect solution, <em>but it is no worse than not testing the flags to begin with</em>.</p>
+<h1 id="conclusion">Conclusion</h1>
+<p>Although testcases are somewhat easier to write — and made stable — if we do not propagate <code>JAVA_OPTIONS</code>, <em>extra care should be taken</em> to actually propagate <code>JAVA_OPTIONS</code>. Our goal must be to test well, and for hotspot tests that means that many flags must be tested. Ignoring flags will not lead to good testing.</p>
+<p>Many tests need no changes at all, and can move from the <em>limited</em> API to the one that propagates VM flags without further changes. When changes are needed, we can guard against certain flags using <code>@require</code> lines. Often that is not even needed as jtreg prepends <code>JAVA_OPTIONS</code> instead of appending them.</p>
+<p>If a testcase is fragile when flags change, one may opt to mark it using <code>@keyword flag-sensitive</code>.</p>
+    </section>
+</article>
+
+        </main>
+
+        <footer>
+          What I write is my opinion and <bf>not</bf> the opinion of my
+employer.
+        </footer>
+    </body>
+</html>
